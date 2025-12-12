@@ -1,9 +1,56 @@
+# Target platform selection
+# Usage: make train_gpt2 TARGET=<target>
+# Targets:
+#   a64fx        - Cross-compile for A64FX with SVE 512-bit (default)
+#   a64fx_native - Native compilation on A64FX
+#   intel        - x86_64 with -march=native
+TARGET ?= a64fx
+
+# Base compiler settings
 CC ?= clang
 CFLAGS = -Ofast -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes
 LDFLAGS =
 LDLIBS = -lm
 INCLUDES =
-CFLAGS_COND = -march=native
+CFLAGS_COND =
+
+ifeq ($(TARGET), a64fx)
+  # Cross-compile for A64FX using Clang (default)
+  CC = clang
+  CFLAGS += --target=aarch64-linux-gnu
+  CFLAGS += -march=armv8.2-a+sve -msve-vector-bits=512
+  CFLAGS += -DUSE_SVE -DSVE_VECTOR_BITS=512
+  CFLAGS += -ffp-contract=fast -ffast-math
+  # Cross-compile sysroot (adjust path as needed)
+  ifdef A64FX_SYSROOT
+    CFLAGS += --sysroot=$(A64FX_SYSROOT)
+    LDFLAGS += --sysroot=$(A64FX_SYSROOT)
+  endif
+  $(info ✓ Cross-compiling for A64FX (SVE 512-bit))
+else ifeq ($(TARGET), a64fx_native)
+  # Native compilation on A64FX using Clang
+  CC = clang
+  CFLAGS += -mcpu=a64fx -march=armv8.2-a+sve -msve-vector-bits=512
+  CFLAGS += -DUSE_SVE -DSVE_VECTOR_BITS=512
+  CFLAGS += -ffp-contract=fast -ffast-math
+  $(info ✓ Native compilation for A64FX with Clang (SVE 512-bit))
+else ifeq ($(TARGET), a64fx_fcc)
+  # Native compilation on A64FX using Fujitsu fcc compiler
+  CC = fcc
+  CFLAGS = -O3 -Kfast,openmp
+  CFLAGS += -I/opt/FJSVxtclanga/.common/CECA018/include
+  CFLAGS += -DUSE_SVE -DSVE_VECTOR_BITS=512
+  CFLAGS_COND =
+  LDLIBS = -lm
+  $(info ✓ Native compilation for A64FX with fcc)
+else ifeq ($(TARGET), intel)
+  # Intel/AMD x86_64 native compilation
+  CC ?= clang
+  CFLAGS_COND = -march=native
+  $(info ✓ Building for Intel/AMD x86_64)
+else
+  $(error Unknown TARGET=$(TARGET). Valid targets: a64fx, a64fx_native, intel)
+endif
 
 # Find nvcc
 SHELL_UNAME = $(shell uname)
@@ -244,10 +291,15 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
+.PHONY: all train_gpt2 test_gpt2 test_sve_math train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
 
 # Add targets
 TARGETS = train_gpt2 test_gpt2
+
+# SVE math test (only for A64FX targets)
+ifneq (,$(filter $(TARGET),a64fx a64fx_native a64fx_fcc))
+    TARGETS += test_sve_math
+endif
 
 # Conditional inclusion of CUDA targets
 ifeq ($(NVCC),)
@@ -265,6 +317,9 @@ train_gpt2: train_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 test_gpt2: test_gpt2.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+
+test_sve_math: test_sve_math.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 $(NVCC_CUDNN): llmc/cudnn_att.cpp

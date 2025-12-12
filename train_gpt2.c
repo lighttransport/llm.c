@@ -27,6 +27,10 @@ There will be other versions of this code that specialize it and make it fast.
 #include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
+// SVE-optimized kernels for A64FX
+#ifdef USE_SVE
+#include "llmc/sve_kernels.h"
+#endif
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
@@ -39,6 +43,9 @@ void encoder_forward(float* out,
     // inp is (B,T) of integers, holding the token ids at each (b,t) position
     // wte is (V,C) of token embeddings, short for "weight token embeddings"
     // wpe is (maxT,C) of position embeddings, short for "weight positional embedding"
+#ifdef USE_SVE
+    encoder_forward_sve(out, inp, wte, wpe, B, T, C);
+#else
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the output position in out[b,t,:]
@@ -55,6 +62,7 @@ void encoder_forward(float* out,
             }
         }
     }
+#endif
 }
 
 void encoder_backward(float* dwte, float* dwpe,
@@ -83,6 +91,9 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     // mean and rstd are (B,T) buffers, to be used later in backward pass
     // at each position (b,t) of the input, the C-dimensional vector
     // of activations gets normalized, then scaled and shifted
+#ifdef USE_SVE
+    layernorm_forward_sve(out, mean, rstd, inp, weight, bias, B, T, C);
+#else
     float eps = 1e-5f;
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
@@ -115,6 +126,7 @@ void layernorm_forward(float* out, float* mean, float* rstd,
             rstd[b * T + t] = s;
         }
     }
+#endif
 }
 
 void layernorm_backward(float* dinp, float* dweight, float* dbias,
@@ -191,6 +203,10 @@ void matmul_forward(float* out,
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
     // out will be (B,T,OC)
 
+#ifdef USE_SVE
+    // Use SVE-optimized blocked matmul for A64FX
+    matmul_forward_sve_blocked(out, inp, weight, bias, B * T, C, OC);
+#else
     // make sure the tiled loop will be correct or fallback to naive version
     const int LOOP_UNROLL = 8;
     if (B*T % LOOP_UNROLL != 0) {
@@ -226,6 +242,7 @@ void matmul_forward(float* out,
             }
         }
     }
+#endif
 }
 
 void matmul_backward(float* dinp, float* dweight, float* dbias,
@@ -407,11 +424,15 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 void gelu_forward(float* out, float* inp, int N) {
     // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
+#ifdef USE_SVE
+    gelu_forward_sve(out, inp, N);
+#else
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
         out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
     }
+#endif
 }
 
 // we want to use -Ofast optimization, but sadly GeLU breaks, so disable this flag just for it (#168)
@@ -434,9 +455,13 @@ void gelu_backward(float* dinp, float* inp, float* dout, int N) {
 #pragma float_control(pop)
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
+#ifdef USE_SVE
+    residual_forward_sve(out, inp1, inp2, N);
+#else
     for (int i = 0; i < N; i++) {
         out[i] = inp1[i] + inp2[i];
     }
+#endif
 }
 
 void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
@@ -451,6 +476,9 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
     // input: logits is (B,T,Vp) of the unnormalized log probabilities
     // Vp is the padded vocab size (for efficiency), V is the "real" vocab size
     // example: Vp is 50304 and V is 50257
+#ifdef USE_SVE
+    softmax_forward_sve(probs, logits, B, T, V, Vp);
+#else
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
@@ -481,6 +509,7 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
             }
         }
     }
+#endif
 }
 
 void crossentropy_forward(float* losses,
