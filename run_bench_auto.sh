@@ -32,6 +32,14 @@ echo "Running SVE Math Benchmark (single thread, N=100000)..."
 ./test_sve_math -n 100000 -w 2 -i 10
 
 echo ""
+echo "Building train_gpt2 to verify attention kernel..."
+make train_gpt2 TARGET=a64fx_fcc 2>&1 || { echo "train_gpt2 build failed"; exit 1; }
+
+echo ""
+echo "train_gpt2 binary check:"
+file ./train_gpt2
+
+echo ""
 echo "Done at $(date)"
 
 exit 0

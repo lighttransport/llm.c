@@ -1,10 +1,14 @@
 # Target platform selection
-# Usage: make train_gpt2 TARGET=<target>
+# Usage: make train_gpt2 TARGET=<target> [SVE=0]
 # Targets:
 #   a64fx        - Cross-compile for A64FX with SVE 512-bit (default)
-#   a64fx_native - Native compilation on A64FX
+#   a64fx_native - Native compilation on A64FX with Clang
+#   a64fx_fcc    - Native compilation on A64FX with Fujitsu fcc
 #   intel        - x86_64 with -march=native
+# Options:
+#   SVE=0        - Disable SVE kernels (for A64FX targets, useful for testing)
 TARGET ?= a64fx
+SVE ?= 1
 
 # Base compiler settings
 CC ?= clang
@@ -19,30 +23,42 @@ ifeq ($(TARGET), a64fx)
   CC = clang
   CFLAGS += --target=aarch64-linux-gnu
   CFLAGS += -march=armv8.2-a+sve -msve-vector-bits=512
-  CFLAGS += -DUSE_SVE -DSVE_VECTOR_BITS=512
   CFLAGS += -ffp-contract=fast -ffast-math
+  ifeq ($(SVE), 1)
+    CFLAGS += -DUSE_SVE -DSVE_VECTOR_BITS=512
+    $(info ✓ Cross-compiling for A64FX (SVE 512-bit))
+  else
+    $(info ✓ Cross-compiling for A64FX (SVE disabled))
+  endif
   # Cross-compile sysroot (adjust path as needed)
   ifdef A64FX_SYSROOT
     CFLAGS += --sysroot=$(A64FX_SYSROOT)
     LDFLAGS += --sysroot=$(A64FX_SYSROOT)
   endif
-  $(info ✓ Cross-compiling for A64FX (SVE 512-bit))
 else ifeq ($(TARGET), a64fx_native)
   # Native compilation on A64FX using Clang
   CC = clang
   CFLAGS += -mcpu=a64fx -march=armv8.2-a+sve -msve-vector-bits=512
-  CFLAGS += -DUSE_SVE -DSVE_VECTOR_BITS=512
   CFLAGS += -ffp-contract=fast -ffast-math
-  $(info ✓ Native compilation for A64FX with Clang (SVE 512-bit))
+  ifeq ($(SVE), 1)
+    CFLAGS += -DUSE_SVE -DSVE_VECTOR_BITS=512
+    $(info ✓ Native compilation for A64FX with Clang (SVE 512-bit))
+  else
+    $(info ✓ Native compilation for A64FX with Clang (SVE disabled))
+  endif
 else ifeq ($(TARGET), a64fx_fcc)
   # Native compilation on A64FX using Fujitsu fcc compiler
   CC = fcc
   CFLAGS = -O3 -Kfast,openmp
   CFLAGS += -I/opt/FJSVxtclanga/.common/CECA018/include
-  CFLAGS += -DUSE_SVE -DSVE_VECTOR_BITS=512
   CFLAGS_COND =
   LDLIBS = -lm
-  $(info ✓ Native compilation for A64FX with fcc)
+  ifeq ($(SVE), 1)
+    CFLAGS += -DUSE_SVE -DSVE_VECTOR_BITS=512
+    $(info ✓ Native compilation for A64FX with fcc (SVE 512-bit))
+  else
+    $(info ✓ Native compilation for A64FX with fcc (SVE disabled))
+  endif
 else ifeq ($(TARGET), intel)
   # Intel/AMD x86_64 native compilation
   CC ?= clang
@@ -291,14 +307,14 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 test_sve_math train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
+.PHONY: all train_gpt2 test_gpt2 test_sve_math test_sve_kernels train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
 
 # Add targets
 TARGETS = train_gpt2 test_gpt2
 
-# SVE math test (only for A64FX targets)
+# SVE tests (only for A64FX targets)
 ifneq (,$(filter $(TARGET),a64fx a64fx_native a64fx_fcc))
-    TARGETS += test_sve_math
+    TARGETS += test_sve_math test_sve_kernels
 endif
 
 # Conditional inclusion of CUDA targets
@@ -320,6 +336,9 @@ test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 test_sve_math: test_sve_math.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+
+test_sve_kernels: test_sve_kernels.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 $(NVCC_CUDNN): llmc/cudnn_att.cpp

@@ -295,6 +295,9 @@ void attention_forward(float* out, float* preatt, float* att,
     // attention is the only layer that mixes information across time
     // every other operation is applied at every (b,t) position independently
     // (and of course, no layer mixes information across batch)
+#ifdef USE_SVE
+    attention_forward_sve(out, preatt, att, inp, B, T, C, NH);
+#else
     int C3 = C*3;
     int hs = C / NH; // head size
     float scale = 1.0 / sqrtf(hs);
@@ -359,6 +362,7 @@ void attention_forward(float* out, float* preatt, float* att,
             }
         }
     }
+#endif
 }
 
 void attention_backward(float* dinp, float* dpreatt, float* datt,

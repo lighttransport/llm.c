@@ -265,6 +265,175 @@ static inline void residual_forward_sve(float* out, const float* inp1, const flo
 }
 
 // ----------------------------------------------------------------------------
+// SVE-optimized attention forward
+// inp is (B, T, 3C) holding Q, K, V vectors
+// preatt, att are (B, NH, T, T) for pre/post-attention scores
+// out is (B, T, C)
+
+static inline void attention_forward_sve(float* out, float* preatt, float* att,
+                                          const float* inp,
+                                          int B, int T, int C, int NH) {
+    int C3 = C * 3;
+    int hs = C / NH;  // head size
+    float scale = 1.0f / sqrtf((float)hs);
+
+    #pragma omp parallel for collapse(3)
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            for (int h = 0; h < NH; h++) {
+                const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+                float* preatt_bth = preatt + b * NH * T * T + h * T * T + t * T;
+                float* att_bth = att + b * NH * T * T + h * T * T + t * T;
+
+                svbool_t pg = svptrue_b32();
+                uint64_t vl = svcntw();
+
+                // Pass 1: calculate query dot key and find maxval
+                float maxval = -1e10f;
+
+                for (int t2 = 0; t2 <= t; t2++) {
+                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C;
+
+                    // SVE vectorized dot product: query_t . key_t2
+                    svfloat32_t acc = svdup_f32(0.0f);
+                    int i = 0;
+
+                    for (; i + (int)vl <= hs; i += (int)vl) {
+                        svfloat32_t q_vec = svld1_f32(pg, query_t + i);
+                        svfloat32_t k_vec = svld1_f32(pg, key_t2 + i);
+                        acc = svmla_f32_x(pg, acc, q_vec, k_vec);
+                    }
+                    float val = svaddv_f32(pg, acc);
+
+                    // Handle remaining elements with predicated load
+                    if (i < hs) {
+                        svbool_t pg_tail = svwhilelt_b32((uint32_t)i, (uint32_t)hs);
+                        svfloat32_t q_vec = svld1_f32(pg_tail, query_t + i);
+                        svfloat32_t k_vec = svld1_f32(pg_tail, key_t2 + i);
+                        svfloat32_t prod = svmul_f32_x(pg_tail, q_vec, k_vec);
+                        val += svaddv_f32(pg_tail, prod);
+                    }
+
+                    val *= scale;
+                    preatt_bth[t2] = val;
+                    if (val > maxval) {
+                        maxval = val;
+                    }
+                }
+
+                // Pass 2: calculate exp and sum (using vectorized libm expf)
+                float expsum = 0.0f;
+
+                // Process in SVE vector-sized chunks
+                int t2 = 0;
+                for (; t2 + (int)vl <= t + 1; t2 += (int)vl) {
+                    svfloat32_t preatt_vec = svld1_f32(pg, preatt_bth + t2);
+                    svfloat32_t shifted = svsub_f32_x(pg, preatt_vec, svdup_f32(maxval));
+
+                    // Compute exp element-wise using libm (store, compute, load back)
+                    float shifted_arr[SVE_MAX_FLOATS];
+                    float exp_arr[SVE_MAX_FLOATS];
+                    svst1_f32(pg, shifted_arr, shifted);
+
+                    for (int k = 0; k < (int)vl; k++) {
+                        exp_arr[k] = expf(shifted_arr[k]);
+                        expsum += exp_arr[k];
+                    }
+
+                    svfloat32_t exp_vec = svld1_f32(pg, exp_arr);
+                    svst1_f32(pg, att_bth + t2, exp_vec);
+                }
+
+                // Handle remaining elements
+                if (t2 <= t) {
+                    svbool_t pg_tail = svwhilelt_b32((uint32_t)t2, (uint32_t)(t + 1));
+                    svfloat32_t preatt_vec = svld1_f32(pg_tail, preatt_bth + t2);
+                    svfloat32_t shifted = svsub_f32_x(pg_tail, preatt_vec, svdup_f32(maxval));
+
+                    float shifted_arr[SVE_MAX_FLOATS];
+                    float exp_arr[SVE_MAX_FLOATS];
+                    svst1_f32(pg_tail, shifted_arr, shifted);
+
+                    for (int k = 0; k < t + 1 - t2; k++) {
+                        exp_arr[k] = expf(shifted_arr[k]);
+                        expsum += exp_arr[k];
+                    }
+
+                    svfloat32_t exp_vec = svld1_f32(pg_tail, exp_arr);
+                    svst1_f32(pg_tail, att_bth + t2, exp_vec);
+                }
+
+                // Pass 3: normalize (softmax)
+                float expsum_inv = (expsum == 0.0f) ? 0.0f : 1.0f / expsum;
+                svfloat32_t inv_vec = svdup_f32(expsum_inv);
+
+                t2 = 0;
+                for (; t2 + (int)vl <= t + 1; t2 += (int)vl) {
+                    svfloat32_t att_vec = svld1_f32(pg, att_bth + t2);
+                    svfloat32_t norm_vec = svmul_f32_x(pg, att_vec, inv_vec);
+                    svst1_f32(pg, att_bth + t2, norm_vec);
+                }
+
+                // Handle remaining
+                if (t2 <= t) {
+                    svbool_t pg_tail = svwhilelt_b32((uint32_t)t2, (uint32_t)(t + 1));
+                    svfloat32_t att_vec = svld1_f32(pg_tail, att_bth + t2);
+                    svfloat32_t norm_vec = svmul_f32_x(pg_tail, att_vec, inv_vec);
+                    svst1_f32(pg_tail, att_bth + t2, norm_vec);
+                }
+
+                // Zero out causal mask positions (t2 > t)
+                svfloat32_t zero_vec = svdup_f32(0.0f);
+                for (t2 = t + 1; t2 + (int)vl <= T; t2 += (int)vl) {
+                    svst1_f32(pg, att_bth + t2, zero_vec);
+                }
+                if (t2 < T) {
+                    svbool_t pg_tail = svwhilelt_b32((uint32_t)t2, (uint32_t)T);
+                    svst1_f32(pg_tail, att_bth + t2, zero_vec);
+                }
+
+                // Pass 4: accumulate weighted values into output
+                float* out_bth = out + b * T * C + t * C + h * hs;
+
+                // Initialize output to zero using SVE
+                int i = 0;
+                for (; i + (int)vl <= hs; i += (int)vl) {
+                    svst1_f32(pg, out_bth + i, zero_vec);
+                }
+                if (i < hs) {
+                    svbool_t pg_tail = svwhilelt_b32((uint32_t)i, (uint32_t)hs);
+                    svst1_f32(pg_tail, out_bth + i, zero_vec);
+                }
+
+                // Weighted sum of values
+                for (t2 = 0; t2 <= t; t2++) {
+                    const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C * 2;
+                    float att_weight = att_bth[t2];
+                    svfloat32_t att_scalar = svdup_f32(att_weight);
+
+                    i = 0;
+                    for (; i + (int)vl <= hs; i += (int)vl) {
+                        svfloat32_t out_vec = svld1_f32(pg, out_bth + i);
+                        svfloat32_t val_vec = svld1_f32(pg, value_t2 + i);
+                        out_vec = svmla_f32_x(pg, out_vec, val_vec, att_scalar);
+                        svst1_f32(pg, out_bth + i, out_vec);
+                    }
+
+                    // Handle remaining
+                    if (i < hs) {
+                        svbool_t pg_tail = svwhilelt_b32((uint32_t)i, (uint32_t)hs);
+                        svfloat32_t out_vec = svld1_f32(pg_tail, out_bth + i);
+                        svfloat32_t val_vec = svld1_f32(pg_tail, value_t2 + i);
+                        out_vec = svmla_f32_x(pg_tail, out_vec, val_vec, att_scalar);
+                        svst1_f32(pg_tail, out_bth + i, out_vec);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
 // SVE-optimized softmax forward
 
 static inline void softmax_forward_sve(float* probs, const float* logits, int B, int T, int V, int Vp) {
